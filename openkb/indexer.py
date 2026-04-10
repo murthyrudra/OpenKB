@@ -92,7 +92,7 @@ def index_long_document(pdf_path: Path, kb_dir: Path) -> IndexResult:
     # Write wiki/summaries/ (no images, just summaries)
     summaries_dir = kb_dir / "wiki" / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
-    summary_md = render_summary_md(tree, doc_name, doc_id)
+    summary_md = render_summary_md(tree, pdf_path.stem, doc_id)
     (summaries_dir / f"{pdf_path.stem}.md").write_text(summary_md, encoding="utf-8")
 
     return IndexResult(doc_id=doc_id, description=description, tree=tree)
