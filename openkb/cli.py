@@ -1,10 +1,13 @@
 """OpenKB CLI — command-line interface for the knowledge base workflow."""
+
 from __future__ import annotations
 
 # Silence import-time warnings (e.g. pydub's missing-ffmpeg warning emitted
 # when markitdown pulls it in). markitdown later clobbers the filters during
 # its own import, so we re-apply after all imports below.
+from openkb.converter import ConvertResult
 import warnings
+
 warnings.filterwarnings("ignore")
 
 import asyncio
@@ -16,69 +19,49 @@ from pathlib import Path
 import os
 
 from agents import set_tracing_disabled
+
 set_tracing_disabled(True)
 # Use local model cost map — skip fetching from GitHub on every invocation
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import click
 import litellm
-litellm.suppress_debug_info = True
-from dotenv import load_dotenv
 
-from openkb.config import DEFAULT_CONFIG, load_config, save_config, load_global_config, register_kb
+litellm.suppress_debug_info = False
+from dotenv import load_dotenv, dotenv_values
+
+from openkb.config import (
+    DEFAULT_CONFIG,
+    load_config,
+    save_config,
+    load_global_config,
+    register_kb,
+)
 from openkb.converter import convert_document
 from openkb.log import append_log
 from openkb.schema import AGENTS_MD
 
 # Suppress warnings after all imports — markitdown overrides filters at import time
 import warnings
+
 warnings.filterwarnings("ignore")
 
 load_dotenv()  # load from cwd (covers running inside the KB dir)
 
 
-def _setup_llm_key(kb_dir: Path | None = None) -> None:
-    """Set LiteLLM API key from LLM_API_KEY env var if present.
-
-    Load order (override=False, so first one wins):
-    1. System environment variables (already set)
-    2. KB-local .env  (kb_dir/.env)
-    3. Global .env    (~/.config/openkb/.env)
-
-    Also propagates to provider-specific env vars (OPENAI_API_KEY, etc.)
-    so that the Agents SDK litellm provider can pick them up.
-    """
-    if kb_dir is not None:
-        env_file = kb_dir / ".env"
-        if env_file.exists():
-            load_dotenv(env_file, override=False)
-
-    from openkb.config import GLOBAL_CONFIG_DIR
-    global_env = GLOBAL_CONFIG_DIR / ".env"
-    if global_env.exists():
-        load_dotenv(global_env, override=False)
-
-    api_key = os.environ.get("LLM_API_KEY", "")
-    if not api_key:
-        # Check if any provider key is already set
-        has_key = any(os.environ.get(k) for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"))
-        if not has_key:
-            click.echo(
-                "Warning: No LLM API key found. Set one of:\n"
-                f"  1. {kb_dir / '.env' if kb_dir else '<kb_dir>/.env'} — LLM_API_KEY=sk-...\n"
-                f"  2. {GLOBAL_CONFIG_DIR / '.env'} — LLM_API_KEY=sk-...\n"
-                "  3. Export LLM_API_KEY in your shell profile"
-            )
-    else:
-        litellm.api_key = api_key
-        for env_var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
-            if not os.environ.get(env_var):
-                os.environ[env_var] = api_key
-
 # Supported document extensions for the `add` command
 SUPPORTED_EXTENSIONS = {
-    ".pdf", ".md", ".markdown", ".docx", ".pptx", ".xlsx",
-    ".html", ".htm", ".txt", ".csv",
+    ".pdf",
+    ".md",
+    ".markdown",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".html",
+    ".htm",
+    ".txt",
+    ".csv",
+    ".json",
 }
 
 # Map raw doc types to display types
@@ -86,7 +69,19 @@ _TYPE_DISPLAY_MAP = {
     "long_pdf": "pageindex",
 }
 
-_SHORT_DOC_TYPES = {"pdf", "docx", "md", "markdown", "html", "htm", "txt", "csv", "pptx", "xlsx"}
+_SHORT_DOC_TYPES = {
+    "pdf",
+    "docx",
+    "md",
+    "markdown",
+    "html",
+    "htm",
+    "txt",
+    "csv",
+    "pptx",
+    "xlsx",
+    "json",
+}
 
 
 def _display_type(raw_type: str) -> str:
@@ -101,6 +96,7 @@ def _display_type(raw_type: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_kb_dir(override: Path | None = None) -> Path | None:
     """Find the KB root: explicit override → walk up from cwd → global default_kb."""
@@ -137,20 +133,23 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
     3. If long doc: run PageIndex then compile_long_doc.
     4. Else: compile_short_doc.
     """
-    from openkb.agent.compiler import compile_long_doc, compile_short_doc
+    from openkb.agent.compiler import (
+        compile_long_doc,
+        compile_short_doc,
+        compile_json_doc,
+    )
     from openkb.state import HashRegistry
 
     logger = logging.getLogger(__name__)
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
     registry = HashRegistry(openkb_dir / "hashes.json")
 
     # 2. Convert document
     click.echo(f"Adding: {file_path.name}")
     try:
-        result = convert_document(file_path, kb_dir)
+        result: ConvertResult = convert_document(file_path, kb_dir)
     except Exception as exc:
         click.echo(f"  [ERROR] Conversion failed: {exc}")
         logger.debug("Conversion traceback:", exc_info=True)
@@ -167,6 +166,7 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
         click.echo(f"  Long document detected — indexing with PageIndex...")
         try:
             from openkb.indexer import index_long_document
+
             index_result = index_long_document(result.raw_path, kb_dir)
         except Exception as exc:
             click.echo(f"  [ERROR] Indexing failed: {exc}")
@@ -178,8 +178,35 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
         for attempt in range(2):
             try:
                 asyncio.run(
-                    compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
-                                     doc_description=index_result.description)
+                    compile_long_doc(
+                        doc_name,
+                        summary_path,
+                        index_result.doc_id,
+                        kb_dir,
+                        model,
+                        doc_description=index_result.description,
+                    )
+                )
+                break
+            except Exception as exc:
+                if attempt == 0:
+                    click.echo(f"  Retrying compilation in 2s...")
+                    time.sleep(2)
+                else:
+                    click.echo(f"  [ERROR] Compilation failed: {exc}")
+                    logger.debug("Compilation traceback:", exc_info=True)
+                    return
+    elif result.is_json_doc:
+        click.echo(f"  JSON document detected — indexing with PageIndex...")
+        for attempt in range(2):
+            try:
+                asyncio.run(
+                    compile_json_doc(
+                        doc_name,
+                        result.source_path,
+                        kb_dir,
+                        model,
+                    )
                 )
                 break
             except Exception as exc:
@@ -191,10 +218,17 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
                     logger.debug("Compilation traceback:", exc_info=True)
                     return
     else:
-        click.echo(f"  Compiling short doc...")
+        click.echo(f"  Compiling short doc... using model: {model}")
         for attempt in range(2):
             try:
-                asyncio.run(compile_short_doc(doc_name, result.source_path, kb_dir, model))
+                asyncio.run(
+                    compile_short_doc(
+                        doc_name,
+                        result.source_path,
+                        kb_dir,
+                        model,
+                    )
+                )
                 break
             except Exception as exc:
                 if attempt == 0:
@@ -218,9 +252,18 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 @click.group()
-@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable verbose logging.")
-@click.option("--kb-dir", "kb_dir_override", default=None, type=click.Path(exists=True, file_okay=False, resolve_path=True), help="Path to a KB root directory (overrides auto-detection).")
+@click.option(
+    "-v", "--verbose", is_flag=True, default=False, help="Enable verbose logging."
+)
+@click.option(
+    "--kb-dir",
+    "kb_dir_override",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help="Path to a KB root directory (overrides auto-detection).",
+)
 @click.pass_context
 def cli(ctx, verbose, kb_dir_override):
     """OpenKB — Karpathy's LLM Knowledge Base workflow, powered by PageIndex."""
@@ -265,7 +308,9 @@ def init():
     click.echo("Pick an LLM in `provider/model` LiteLLM format:")
     click.echo("  OpenAI:    gpt-5.4-mini, gpt-5.4")
     click.echo("  Anthropic: anthropic/claude-sonnet-4-6, anthropic/claude-opus-4-6")
-    click.echo("  Gemini:    gemini/gemini-3.1-pro-preview, gemini/gemini-3-flash-preview")
+    click.echo(
+        "  Gemini:    gemini/gemini-3.1-pro-preview, gemini/gemini-3-flash-preview"
+    )
     click.echo("  Others:    see https://docs.litellm.ai/docs/providers")
     click.echo()
     model = click.prompt(
@@ -307,7 +352,9 @@ def init():
     if api_key:
         env_path = Path(".env")
         if env_path.exists():
-            click.echo(".env already exists, skipping write. Add LLM_API_KEY manually if needed.")
+            click.echo(
+                ".env already exists, skipping write. Add LLM_API_KEY manually if needed."
+            )
         else:
             env_path.write_text(f"LLM_API_KEY={api_key}\n", encoding="utf-8")
             os.chmod(env_path, 0o600)
@@ -336,7 +383,8 @@ def add(ctx, path):
 
     if target.is_dir():
         files = [
-            f for f in sorted(target.rglob("*"))
+            f
+            for f in sorted(target.rglob("*"))
             if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
         ]
         if not files:
@@ -359,10 +407,14 @@ def add(ctx, path):
 
 @cli.command()
 @click.argument("question")
-@click.option("--save", is_flag=True, default=False, help="Save the answer to wiki/explorations/.")
 @click.option(
-    "--raw", "raw",
-    is_flag=True, default=False,
+    "--save", is_flag=True, default=False, help="Save the answer to wiki/explorations/."
+)
+@click.option(
+    "--raw",
+    "raw",
+    is_flag=True,
+    default=False,
     help="Show raw markdown source instead of rendered output (keeps tool-call colors).",
 )
 @click.pass_context
@@ -377,7 +429,6 @@ def query(ctx, question, save, raw):
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
     try:
@@ -390,40 +441,54 @@ def query(ctx, question, save, raw):
 
     if save and answer:
         import re
+
         slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60]
         explore_dir = kb_dir / "wiki" / "explorations"
         explore_dir.mkdir(parents=True, exist_ok=True)
         explore_path = explore_dir / f"{slug}.md"
         explore_path.write_text(
-            f"---\nquery: \"{question}\"\n---\n\n{answer}\n", encoding="utf-8"
+            f'---\nquery: "{question}"\n---\n\n{answer}\n', encoding="utf-8"
         )
         click.echo(f"\nSaved to {explore_path}")
 
 
 @cli.command()
 @click.option(
-    "--resume", "-r", "resume",
-    is_flag=False, flag_value="__latest__", default=None, metavar="[ID]",
+    "--resume",
+    "-r",
+    "resume",
+    is_flag=False,
+    flag_value="__latest__",
+    default=None,
+    metavar="[ID]",
     help="Resume the latest chat session, or a specific one by id or prefix.",
 )
 @click.option(
-    "--list", "list_sessions_flag",
-    is_flag=True, default=False,
+    "--list",
+    "list_sessions_flag",
+    is_flag=True,
+    default=False,
     help="List chat sessions.",
 )
 @click.option(
-    "--delete", "delete_id",
-    default=None, metavar="ID",
+    "--delete",
+    "delete_id",
+    default=None,
+    metavar="ID",
     help="Delete a chat session by id or prefix.",
 )
 @click.option(
-    "--no-color", "no_color",
-    is_flag=True, default=False,
+    "--no-color",
+    "no_color",
+    is_flag=True,
+    default=False,
     help="Disable colored output.",
 )
 @click.option(
-    "--raw", "raw",
-    is_flag=True, default=False,
+    "--raw",
+    "raw",
+    is_flag=True,
+    default=False,
     help="Show raw markdown source instead of rendered output (keeps prompt and tool-call colors).",
 )
 @click.pass_context
@@ -453,12 +518,8 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
         for s in sessions:
             rel = relative_time(s.get("updated_at", ""))
             title = s.get("title") or "(empty)"
-            click.echo(
-                f"  {s['id']:<22} {s['turn_count']:<6} {rel:<12} {title}"
-            )
-        click.echo(
-            f"\n{len(sessions)} session(s) in {kb_dir / '.openkb' / 'chats'}"
-        )
+            click.echo(f"  {s['id']:<22} {s['turn_count']:<6} {rel:<12} {title}")
+        click.echo(f"\n{len(sessions)} session(s) in {kb_dir / '.openkb' / 'chats'}")
         return
 
     if delete_id is not None:
@@ -478,7 +539,6 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
 
     if resume is not None:
         try:
@@ -554,11 +614,12 @@ async def run_lint(kb_dir: Path) -> Path | None:
     else:
         hashes = {}
     if not hashes:
-        click.echo("Nothing to lint — no documents indexed yet. Run `openkb add` first.")
+        click.echo(
+            "Nothing to lint — no documents indexed yet. Run `openkb add` first."
+        )
         return
 
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
     click.echo("Running structural lint...")
@@ -576,6 +637,7 @@ async def run_lint(kb_dir: Path) -> Path | None:
     reports_dir = kb_dir / "wiki" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     import datetime
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = reports_dir / f"lint_{timestamp}.md"
     report_content = f"# Lint Report — {timestamp}\n\n## Structural\n\n{structural_report}\n\n## Semantic\n\n{knowledge_report}\n"
@@ -586,12 +648,19 @@ async def run_lint(kb_dir: Path) -> Path | None:
 
 
 @cli.command()
-@click.option("--fix", is_flag=True, default=False, help="Automatically fix lint issues (not yet implemented).")
+@click.option(
+    "--fix",
+    is_flag=True,
+    default=False,
+    help="Automatically fix lint issues (not yet implemented).",
+)
 @click.pass_context
 def lint(ctx, fix):
     """Lint the knowledge base for structural and semantic inconsistencies."""
     if fix:
-        click.echo("Warning: --fix is not yet implemented. Running lint in report-only mode.")
+        click.echo(
+            "Warning: --fix is not yet implemented. Running lint in report-only mode."
+        )
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
@@ -701,6 +770,7 @@ def print_status(kb_dir: Path) -> None:
         if summaries:
             newest_summary = max(summaries, key=lambda p: p.stat().st_mtime)
             import datetime
+
             mtime = datetime.datetime.fromtimestamp(newest_summary.stat().st_mtime)
             click.echo(f"  Last compile:  {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -711,6 +781,7 @@ def print_status(kb_dir: Path) -> None:
         if reports:
             newest_report = max(reports, key=lambda p: p.stat().st_mtime)
             import datetime
+
             mtime = datetime.datetime.fromtimestamp(newest_report.stat().st_mtime)
             click.echo(f"  Last lint:     {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
 

@@ -6,8 +6,8 @@ from typing import Any
 import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.4-mini",
-    "language": "en",
+    "model": "hosted_vllm/sarvamai/sarvam-105b",
+    "language": "te",
     "pageindex_threshold": 20,
 }
 

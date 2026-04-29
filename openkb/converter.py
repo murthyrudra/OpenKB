@@ -1,6 +1,7 @@
 """Document conversion pipeline for OpenKB."""
-from __future__ import annotations
 
+from __future__ import annotations
+from json import load
 import logging
 import shutil
 from dataclasses import dataclass, field
@@ -10,7 +11,11 @@ import pymupdf
 from markitdown import MarkItDown
 
 from openkb.config import load_config
-from openkb.images import copy_relative_images, extract_base64_images, convert_pdf_with_images
+from openkb.images import (
+    copy_relative_images,
+    extract_base64_images,
+    convert_pdf_with_images,
+)
 from openkb.state import HashRegistry
 
 logger = logging.getLogger(__name__)
@@ -23,6 +28,7 @@ class ConvertResult:
     raw_path: Path | None = None
     source_path: Path | None = None
     is_long_doc: bool = False
+    is_json_doc: bool = False
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
 
@@ -69,6 +75,7 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
     if raw_dest.resolve() != src.resolve():
         shutil.copy2(src, raw_dest)
 
+    json_text = ""
     # ------------------------------------------------------------------
     # 3. PDF long-doc detection
     # ------------------------------------------------------------------
@@ -81,7 +88,13 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
                 threshold,
                 src.name,
             )
-            return ConvertResult(raw_path=raw_dest, is_long_doc=True, file_hash=file_hash)
+            return ConvertResult(
+                raw_path=raw_dest, is_long_doc=True, file_hash=file_hash
+            )
+    elif src.suffix.lower() == ".json":
+        with open(src, "r", encoding="utf-8") as f:
+            json_text = load(f)
+            is_json = True
 
     # ------------------------------------------------------------------
     # 4/5. Convert to Markdown
@@ -99,6 +112,8 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
     elif src.suffix.lower() == ".pdf":
         # Use pymupdf dict-mode for PDFs: text + images inline at correct positions
         markdown = convert_pdf_with_images(src, doc_name, images_dir)
+    elif src.suffix.lower() == ".json":
+        markdown = json_text
     else:
         # Non-PDF, non-MD: use markitdown (docx, pptx, html, etc.)
         mid = MarkItDown()
@@ -106,7 +121,26 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
         markdown = result.text_content
         markdown = extract_base64_images(markdown, doc_name, images_dir)
 
-    dest_md = sources_dir / f"{doc_name}.md"
-    dest_md.write_text(markdown, encoding="utf-8")
+    if src.suffix.lower() == ".json":
+        import json
 
-    return ConvertResult(raw_path=raw_dest, source_path=dest_md, file_hash=file_hash)
+        dest_md = sources_dir / f"{doc_name}.json"
+
+        with open(dest_md, "w", encoding="utf-8") as f:
+            json.dump(markdown, f, ensure_ascii=False, indent=2)
+
+        return ConvertResult(
+            raw_path=raw_dest,
+            source_path=dest_md,
+            file_hash=file_hash,
+            is_json_doc=True,
+        )
+    else:
+        dest_md = sources_dir / f"{doc_name}.md"
+        dest_md.write_text(markdown, encoding="utf-8")
+        return ConvertResult(
+            raw_path=raw_dest,
+            source_path=dest_md,
+            file_hash=file_hash,
+            is_json_doc=False,
+        )
