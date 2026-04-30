@@ -24,6 +24,7 @@ from dotenv import dotenv_values
 import litellm
 from slugify import slugify
 from typing import Optional
+from tqdm import tqdm
 
 from openkb.schema import get_agents_md
 
@@ -188,24 +189,26 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
 
 def _llm_call(model: str, messages: list[dict], step_name: str, kwargs) -> str:
     """Single LLM call with animated progress and debug logging."""
-    logger.debug(
+    logger.info(
         "LLM request for model %s, [%s]:\n%s", model, step_name, _fmt_messages(messages)
     )
     if kwargs:
-        logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
+        logger.info("LLM kwargs [%s]: %s", step_name, kwargs)
 
     spinner = _Spinner(step_name)
     spinner.start()
     t0 = time.time()
 
-    response = litellm.completion(model=model, messages=messages, **kwargs)
+    response = litellm.completion(
+        model=model, messages=messages, max_tokens=8192, **kwargs
+    )
     content = response.choices[0].message.content or ""
 
     if "</think>" in content:
         content = content.split("</think>")[-1].strip()
 
     spinner.stop(_format_usage(time.time() - t0, response.usage))
-    logger.debug(
+    logger.info(
         "LLM response [%s]:\n%s",
         step_name,
         content[:500] + ("..." if len(content) > 500 else ""),
@@ -221,7 +224,9 @@ async def _llm_call_async(
 
     t0 = time.time()
 
-    response = await litellm.acompletion(model=model, messages=messages, **kwargs)
+    response = await litellm.acompletion(
+        model=model, messages=messages, max_tokens=8192, **kwargs
+    )
     content = response.choices[0].message.content or ""
 
     elapsed = time.time() - t0
@@ -373,7 +378,7 @@ def _write_summary(
         end = summary.find("---", 3)
         if end != -1:
             summary = summary[end + 3 :].lstrip("\n")
-    summaries_dir = wiki_dir / "summaries"
+    summaries_dir: Path = wiki_dir / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     ext = "md" if doc_type == "short" else "json"
     fm_lines = [
@@ -384,6 +389,18 @@ def _write_summary(
     (summaries_dir / f"{doc_name}.md").write_text(
         frontmatter + summary, encoding="utf-8"
     )
+
+
+def _check_summary_exists(wiki_dir: Path, doc_name: str) -> bool:
+    """Check if summary page exists."""
+
+    summaries_dir: Path = wiki_dir / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.path.exists(summaries_dir / f"{doc_name}.md"):
+        return True
+    else:
+        return False
 
 
 _SAFE_NAME_RE = re.compile(r"[^\w\-]")
@@ -1013,13 +1030,21 @@ async def compile_json_doc(
 
     completion_kwargs, model = _setup_llm_key(openkb_dir)
 
-    for each_chunk in content:
+    for each_chunk in tqdm(content, desc="For each chunk"):
         if len(each_chunk["text"]) > 4000:
             sub_texts = split_text(each_chunk["text"], 4000)
         else:
             sub_texts = [each_chunk["text"]]
 
         for i, sub_text in enumerate(sub_texts):
+            sanitized_name = sanitize_filename(
+                each_chunk["title"], str(each_chunk["node_id"])
+            )
+
+            if _check_summary_exists(wiki_dir, sanitized_name):
+                print(f"Skipping {sanitized_name} as it already exists.")
+                continue
+
             # Base context A: system + document
             system_msg = {
                 "role": "system",
@@ -1048,10 +1073,6 @@ async def compile_json_doc(
             except (json.JSONDecodeError, ValueError):
                 doc_brief = ""
                 summary = summary_raw
-
-            sanitized_name = sanitize_filename(
-                each_chunk["title"], str(each_chunk["node_id"])
-            )
 
             _write_summary(wiki_dir, sanitized_name, summary)
 
