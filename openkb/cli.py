@@ -158,9 +158,9 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
     if result.skipped:
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
         return
-
+    
     doc_name = file_path.stem
-
+    
     # 3/4. Index and compile
     if result.is_long_doc:
         click.echo(f"  Long document detected — indexing with PageIndex...")

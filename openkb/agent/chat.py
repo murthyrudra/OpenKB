@@ -553,7 +553,7 @@ async def run_chat(
     language = session.language or config.get("language", "en")
     wiki_root = str(kb_dir / "wiki")
     agent = build_query_agent(wiki_root, session.model, language=language)
-
+    
     _print_header(session, kb_dir, style)
     if session.turn_count > 0:
         _print_resume_view(session, style)

@@ -24,6 +24,7 @@ from dotenv import dotenv_values
 import litellm
 from slugify import slugify
 from typing import Optional
+from tqdm import tqdm
 
 from openkb.schema import get_agents_md
 
@@ -188,24 +189,26 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
 
 def _llm_call(model: str, messages: list[dict], step_name: str, kwargs) -> str:
     """Single LLM call with animated progress and debug logging."""
-    logger.debug(
+    logger.info(
         "LLM request for model %s, [%s]:\n%s", model, step_name, _fmt_messages(messages)
     )
     if kwargs:
-        logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
+        logger.info("LLM kwargs [%s]: %s", step_name, kwargs)
 
     spinner = _Spinner(step_name)
     spinner.start()
     t0 = time.time()
 
-    response = litellm.completion(model=model, messages=messages, **kwargs)
+    response = litellm.completion(
+        model=model, messages=messages, max_tokens=128000, **kwargs
+    )
     content = response.choices[0].message.content or ""
 
     if "</think>" in content:
         content = content.split("</think>")[-1].strip()
 
     spinner.stop(_format_usage(time.time() - t0, response.usage))
-    logger.debug(
+    logger.info(
         "LLM response [%s]:\n%s",
         step_name,
         content[:500] + ("..." if len(content) > 500 else ""),
@@ -221,7 +224,9 @@ async def _llm_call_async(
 
     t0 = time.time()
 
-    response = await litellm.acompletion(model=model, messages=messages, **kwargs)
+    response = await litellm.acompletion(
+        model=model, messages=messages, max_tokens=32000, **kwargs
+    )
     content = response.choices[0].message.content or ""
 
     elapsed = time.time() - t0
@@ -373,7 +378,7 @@ def _write_summary(
         end = summary.find("---", 3)
         if end != -1:
             summary = summary[end + 3 :].lstrip("\n")
-    summaries_dir = wiki_dir / "summaries"
+    summaries_dir: Path = wiki_dir / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     ext = "md" if doc_type == "short" else "json"
     fm_lines = [
@@ -384,16 +389,15 @@ def _write_summary(
     (summaries_dir / f"{doc_name}.md").write_text(
         frontmatter + summary, encoding="utf-8"
     )
-
-
-_SAFE_NAME_RE = re.compile(r"[^\w\-]")
-
+    
+_SAFE_NAME_RE = re.compile(r'[^\w\-]')
 
 def _sanitize_concept_name(name: str) -> str:
     """Sanitize a concept name for safe use as a filename."""
     name = unicodedata.normalize("NFKC", name)
     sanitized = _SAFE_NAME_RE.sub("-", name).strip("-")
     return sanitized or "unnamed-concept"
+
 
 
 def _write_concept(
@@ -614,10 +618,6 @@ def _update_index(
 # ---------------------------------------------------------------------------
 
 
-def sanitize_filename(title, node_id):
-    return f"{slugify(title, allow_unicode=True)}_{node_id}"
-
-
 DEFAULT_COMPILE_CONCURRENCY = 5
 
 
@@ -646,30 +646,31 @@ async def _compile_concepts(
 
     completion_kwargs, model = _setup_llm_key(openkb_dir)
 
-    plan_raw = _llm_call(
-        model,
-        [
-            system_msg,
-            doc_msg,
-            {"role": "assistant", "content": summary},
-            {
-                "role": "user",
-                "content": _CONCEPTS_PLAN_USER.format(
-                    concept_briefs=concept_briefs,
-                ),
-            },
-        ],
-        "concepts-plan",
-        kwargs=completion_kwargs,
-    )
-
     try:
+        plan_raw = _llm_call(
+            model,
+            [
+                system_msg,
+                doc_msg,
+                {"role": "assistant", "content": summary},
+                {
+                    "role": "user",
+                    "content": _CONCEPTS_PLAN_USER.format(
+                        concept_briefs=concept_briefs,
+                    ),
+                },
+            ],
+            "concepts-plan",
+            kwargs=completion_kwargs,
+        )
+
         parsed = _parse_json(plan_raw)
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning("Failed to parse concepts plan: %s", exc)
         logger.debug("Raw: %s", plan_raw)
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
         return
+
 
     # Fallback: if LLM returns a flat list, treat all items as "create"
     if isinstance(parsed, list):
@@ -783,9 +784,7 @@ async def _compile_concepts(
                 logger.warning("Concept generation failed: %s", r)
                 continue
             name, page_content, is_update, brief = r
-            _write_concept(
-                wiki_dir, name, page_content, source_file, is_update, brief=brief
-            )
+            _write_concept(wiki_dir, name, page_content, source_file, is_update, brief=brief)
             safe_name = _sanitize_concept_name(name)
             concept_names.append(safe_name)
             if brief:
@@ -1013,13 +1012,19 @@ async def compile_json_doc(
 
     completion_kwargs, model = _setup_llm_key(openkb_dir)
 
-    for each_chunk in content:
+    for each_chunk in tqdm(content, desc="For each chunk"):
         if len(each_chunk["text"]) > 4000:
             sub_texts = split_text(each_chunk["text"], 4000)
         else:
             sub_texts = [each_chunk["text"]]
 
         for i, sub_text in enumerate(sub_texts):
+            sanitized_name = str(each_chunk['title']) + "_" + str(each_chunk["node_id"]) + "_" + str(i)
+            if "/" in sanitized_name:
+                sanitized_name = sanitized_name.replace("/", "_")
+            
+            sanitized_name = sanitized_name.replace(" ", "_")
+
             # Base context A: system + document
             system_msg = {
                 "role": "system",
@@ -1049,23 +1054,23 @@ async def compile_json_doc(
                 doc_brief = ""
                 summary = summary_raw
 
-            sanitized_name = sanitize_filename(
-                each_chunk["title"], str(each_chunk["node_id"])
-            )
-
             _write_summary(wiki_dir, sanitized_name, summary)
 
             # --- Steps 2-4: Concept plan → generate/update → index ---
-            await _compile_concepts(
-                wiki_dir,
-                kb_dir,
-                model,
-                system_msg,
-                doc_msg,
-                summary,
-                doc_name,
-                max_concurrency,
-                doc_brief=doc_brief,
-                doc_type="short",
-                openkb_dir=openkb_dir,
-            )
+            try:
+                await _compile_concepts(
+                    wiki_dir,
+                    kb_dir,
+                    model,
+                    system_msg,
+                    doc_msg,
+                    summary,
+                    doc_name,
+                    max_concurrency,
+                    doc_brief=doc_brief,
+                    doc_type="short",
+                    openkb_dir=openkb_dir,
+                )
+            except:
+                continue
+    

@@ -62,9 +62,9 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
     # 1. Hash check
     # ------------------------------------------------------------------
     file_hash = HashRegistry.hash_file(src)
-    if registry.is_known(file_hash):
-        logger.info("Skipping already-known file: %s", src.name)
-        return ConvertResult(skipped=True)
+    # if registry.is_known(file_hash):
+    #     logger.info("Skipping already-known file: %s", src.name)
+    #     return ConvertResult(skipped=True)
 
     # ------------------------------------------------------------------
     # 2. Copy to raw/

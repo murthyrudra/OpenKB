@@ -7,6 +7,13 @@ from agents import Agent, Runner, function_tool
 
 from agents import ToolOutputImage, ToolOutputText
 from openkb.agent.tools import get_wiki_page_content, read_wiki_file, read_wiki_image
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+import re
+import os
 
 MAX_TURNS = 50
 from openkb.schema import get_agents_md
@@ -39,12 +46,125 @@ Before each tool call, output one short sentence explaining the reason.
 If you cannot find relevant information, say so clearly.
 """
 
+def _setup_llm_key(kb_dir: Path):
+    """Set LiteLLM API key from LLM_API_KEY env var if present.
 
-def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent:
+    Load order (override=False, so first one wins):
+    1. System environment variables (already set)
+    2. KB-local .env  (kb_dir/.env)
+    3. Global .env    (~/.config/openkb/.env)
+
+    Also propagates to provider-specific env vars (OPENAI_API_KEY, etc.)
+    so that the Agents SDK litellm provider can pick them up.
+    """
+    import os
+    from dotenv import dotenv_values
+    env_file = os.path.join(kb_dir, ".env")
+
+    config = dotenv_values(env_file)
+    
+    completion_kwargs = {}
+
+    if "RITS_API_BASE" in config:
+        completion_kwargs["RITS_API_BASE"] = config["RITS_API_BASE"]
+
+    if "RITS_API_KEY" in config:
+        completion_kwargs["RITS_API_KEY"] = config["RITS_API_KEY"]
+
+    return completion_kwargs, config["RITS_MODEL"]
+
+
+def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: str = ".openkb/") -> Agent:
     """Build and return the Q&A agent."""
     schema_md = get_agents_md(Path(wiki_root))
     instructions = _QUERY_INSTRUCTIONS_TEMPLATE.format(schema_md=schema_md)
     instructions += f"\n\nIMPORTANT: Answer in {language} language."
+
+    SEARCH_DIRS = ["summaries", "concepts", "explorations"]
+    documents = []
+    doc_paths = []
+
+    for folder in SEARCH_DIRS:
+        folder_path = os.path.join(wiki_root, folder)
+
+        if not os.path.exists(folder_path):
+            continue
+
+        for file_path in Path(folder_path).rglob("*.md"):
+            try:
+                text = file_path.read_text(encoding="utf-8")
+
+                documents.append(text)
+                doc_paths.append(file_path.relative_to(wiki_root).as_posix())
+
+            except Exception:
+                continue
+
+    embedding_model = SentenceTransformer(
+        "BAAI/bge-small-en-v1.5"
+    )
+
+    document_embeddings = embedding_model.encode(
+        documents,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+    )
+
+    document_embeddings = np.array(document_embeddings)
+
+    @function_tool(name_override="search")
+    def search(query: str, top_k: int = 5) -> str:
+        """
+        Semantic vector search over the wiki.
+
+        Use this tool first before read_file.
+
+        Args:
+            query: Search query.
+            top_k: Number of results.
+        """
+
+        print(f"\n[SEARCH QUERY] {query}")
+
+        # Embed query
+        query_embedding = embedding_model.encode(
+            query,
+            normalize_embeddings=True,
+        )
+
+        # Cosine similarity
+        scores = cosine_similarity(
+            [query_embedding],
+            document_embeddings
+        )[0]
+
+        # Rank results
+        ranked_indices = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+
+        for idx in ranked_indices:
+
+            score = scores[idx]
+
+            path = doc_paths[idx]
+
+            preview = documents[idx][:3000].replace("\n", " ")
+
+            results.append(
+                f"""
+    FILE: {path}
+    SIMILARITY: {score:.4f}
+
+    DOCUMENT:
+    {preview}
+    """
+            )
+
+        if not results:
+            return "No relevant documents found."
+
+        return "\n\n".join(results)
 
     @function_tool
     def read_file(path: str) -> str:
@@ -81,13 +201,30 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent
         return ToolOutputText(text=result["text"])
 
     from agents.model_settings import ModelSettings
+    from openai import AsyncOpenAI
+    from agents import OpenAIChatCompletionsModel
+
+    completion_kwargs, model_name = _setup_llm_key(kb_dir)
+
+    client = AsyncOpenAI(
+        api_key="dummy",   # vLLM usually ignores this
+        base_url=completion_kwargs["RITS_API_BASE"],
+        default_headers={
+            "RITS_API_KEY": completion_kwargs["RITS_API_KEY"]
+        }
+    )
+
+    model = OpenAIChatCompletionsModel(
+        model=model_name.split("hosted_vllm/")[-1],
+        openai_client=client,
+    )
 
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, get_image],
-        model=f"litellm/{model}",
-        model_settings=ModelSettings(parallel_tool_calls=False),
+        tools=[read_file, get_page_content, get_image, search],
+        model=model,
+        model_settings=ModelSettings(parallel_tool_calls=False, max_tokens=128000),
     )
 
 
@@ -205,12 +342,34 @@ async def run_query(
                     raw_item = item.raw_item
                     name = getattr(raw_item, "name", "?")
                     args = getattr(raw_item, "arguments", "") or ""
+
+                    try:
+                        import json
+                        parsed_args = json.loads(args)
+                        pretty_args = json.dumps(parsed_args, indent=2)
+                    except Exception:
+                        pretty_args = str(args)
                     if live:
                         live.stop()
                         live = None
                     _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
                     need_blank_before_text = True
                 elif item.type == "tool_call_output_item":
+                    output = getattr(item, "output", None)
+
+                    if output:
+                        preview = str(output)
+
+                        if len(preview) > 1000:
+                            preview = preview[:1000] + "..."
+
+                        _fmt(
+                            style,
+                            (
+                                "class:tool",
+                                f"\n[TOOL OUTPUT]\n{preview}\n"
+                            ),
+                        )
                     pass
     finally:
         if live:
