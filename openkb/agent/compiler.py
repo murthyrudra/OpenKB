@@ -389,8 +389,22 @@ def _write_summary(
     (summaries_dir / f"{doc_name}.md").write_text(
         frontmatter + summary, encoding="utf-8"
     )
-    
-_SAFE_NAME_RE = re.compile(r'[^\w\-]')
+
+
+def _check_summary_exists(wiki_dir: Path, doc_name: str) -> bool:
+    """Check if summary page exists."""
+
+    summaries_dir: Path = wiki_dir / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.path.exists(summaries_dir / f"{doc_name}.md"):
+        return True
+    else:
+        return False
+
+
+_SAFE_NAME_RE = re.compile(r"[^\w\-]")
+
 
 def _sanitize_concept_name(name: str) -> str:
     """Sanitize a concept name for safe use as a filename."""
