@@ -1039,6 +1039,10 @@ async def compile_json_doc(
             
             sanitized_name = sanitized_name.replace(" ", "_")
 
+            if _check_summary_exists(wiki_dir, sanitized_name):
+                print(f"Skipping {sanitized_name} as it already exists.")
+                continue
+
             # Base context A: system + document
             system_msg = {
                 "role": "system",
