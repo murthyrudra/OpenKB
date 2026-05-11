@@ -22,6 +22,19 @@ from openkb.agent.api_agent import AgriwatchClient, ENAMClient
 
 MAX_TURNS = 50
 
+translate_instructions="""
+You are an expert multilingual agricultural translator.
+
+Rules:
+- Preserve crop names.
+- Preserve mandi/market names.
+- Preserve state names.
+- Preserve prices and units exactly.
+- Preserve percentages exactly.
+- Preserve markdown formatting.
+- Only translate human language text.
+- Return only translated text.
+"""
 
 _QUERY_INSTRUCTIONS_TEMPLATE = """\
 You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching the wiki.
@@ -47,14 +60,13 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
     - use get_daily_prices
     - infer commodity/market/state from the user query
     - summarize trends clearly
+7. For query related to commodities and prices (eNAM):
+    - Use get_states to identify states.
+    - Use get_apmc_markets to identify mandis/APMCs.
+    - Use get_enam_commodities to identify commodities.
+    - Use exact IDs returned by tools.
+    - Never invent IDs.
 7. Synthesize a clear, concise, well-cited answer grounded in wiki content.
-
-eNAM workflow:
-1. Use get_states to identify states.
-2. Use get_apmc_markets to identify mandis/APMCs.
-3. Use get_enam_commodities to identify commodities.
-4. Use exact IDs returned by tools.
-5. Never invent IDs.
 
 Answer based only on wiki content. Be concise.
 Before each tool call, output one short sentence explaining the reason.
@@ -87,6 +99,12 @@ def _setup_llm_key(kb_dir: Path):
     if "RITS_API_KEY" in config:
         completion_kwargs["RITS_API_KEY"] = config["RITS_API_KEY"]
 
+    if "RITS_EMBEDDING_MODEL_URL" in config:
+        completion_kwargs["RITS_EMBEDDING_MODEL_URL"] = config["RITS_EMBEDDING_MODEL_URL"]
+
+    if "RITS_EMBEDDING_MODEL" in config:
+        completion_kwargs["RITS_EMBEDDING_MODEL"] = config["RITS_EMBEDDING_MODEL"]
+
     return completion_kwargs, config["RITS_MODEL"]
 
 
@@ -116,19 +134,33 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
             except Exception:
                 continue
 
-    embedding_model = SentenceTransformer(
-        "BAAI/bge-small-en-v1.5"
-    )
-
-    document_embeddings = embedding_model.encode(
-        documents,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-    )
-
-    document_embeddings = np.array(document_embeddings)
-
     agri_client = AgriwatchClient()
+
+    completion_kwargs, model_name = _setup_llm_key(kb_dir)
+
+    from openai import OpenAI
+
+    embedding_client = OpenAI(
+        base_url=completion_kwargs["RITS_EMBEDDING_MODEL_URL"],
+        api_key="dummy", 
+        default_headers={
+            "RITS_API_KEY": completion_kwargs["RITS_API_KEY"]
+        }
+    )
+    rits_embedding_model = completion_kwargs["RITS_EMBEDDING_MODEL"]
+
+    def embed_text(text: str):
+        response = embedding_client.embeddings.create(
+            model=rits_embedding_model,
+            input=text,
+        )
+
+        return response.data[0].embedding
+
+    document_embeddings = np.array([
+        embed_text(doc)
+        for doc in documents
+    ])
 
     @function_tool(name_override="search")
     def search(query: str, top_k: int = 5) -> str:
@@ -144,11 +176,7 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
 
         print(f"\n[SEARCH QUERY] {query}")
 
-        # Embed query
-        query_embedding = embedding_model.encode(
-            query,
-            normalize_embeddings=True,
-        )
+        query_embedding = embed_text(query)
 
         # Cosine similarity
         scores = cosine_similarity(
@@ -247,6 +275,7 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
 
         # Default to today if not provided
         if not date:
+            import datetime
             date = datetime.now().strftime("%Y-%m-%d")
 
         print(f"\n[PRICE QUERY]")
@@ -598,8 +627,6 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
     from openai import AsyncOpenAI
     from agents import OpenAIChatCompletionsModel
 
-    completion_kwargs, model_name = _setup_llm_key(kb_dir)
-
     client = AsyncOpenAI(
         api_key="dummy",   # vLLM usually ignores this
         base_url=completion_kwargs["RITS_API_BASE"],
@@ -656,9 +683,64 @@ async def run_query(
 
     agent = build_query_agent(wiki_root, model, language=language)
 
+    from agents.model_settings import ModelSettings
+    from openai import AsyncOpenAI
+    from agents import OpenAIChatCompletionsModel
+
+    completion_kwargs, model_name = _setup_llm_key(openkb_dir)
+
+    client = AsyncOpenAI(
+        api_key="dummy",   # vLLM usually ignores this
+        base_url=completion_kwargs["RITS_API_BASE"],
+        default_headers={
+            "RITS_API_KEY": completion_kwargs["RITS_API_KEY"]
+        }
+    )
+
+    model = OpenAIChatCompletionsModel(
+        model=model_name.split("hosted_vllm/")[-1],
+        openai_client=client,
+    )
+
+    translation_agent = Agent(
+        name="wiki-query",
+        instructions=translate_instructions,
+        model=model,
+        model_settings=ModelSettings(parallel_tool_calls=False, max_tokens=128000),
+    )
+
+    async def translate_text(
+        text: str,
+        target_language: str,
+    ) -> str:
+
+        result = await Runner.run(
+            translation_agent,
+            f"""
+    Translate the following text into {target_language}.
+
+    TEXT:
+    {text}
+    """,
+        )
+
+        return result.final_output or text
+
+    translated_question = await translate_text(
+        question,
+        "English",
+    )
+
     if not stream:
-        result = await Runner.run(agent, question, max_turns=MAX_TURNS)
-        return result.final_output or ""
+        result = await Runner.run(agent, translated_question, max_turns=MAX_TURNS)
+
+        english_answer = result.final_output or ""
+
+        final_answer = await translate_text(
+            english_answer,
+            language,
+        )
+        return final_answer
 
     import os
     use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
