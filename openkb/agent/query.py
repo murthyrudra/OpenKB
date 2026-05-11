@@ -17,74 +17,10 @@ import re
 import os
 import json
 
-import time 
-from datetime import datetime, timedelta
-import requests
-
-BASE_URL = "https://api.agriwatch.in/apgov"
-HEADERS = {"Content-Type": "application/json"}
-TOKEN_USERID = "apgov_agriwatch"
-MAX_RETRIES = 3
-RETRY_DELAY = 2 # seconds
-
+from openkb.schema import get_agents_md
+from openkb.agent.api_agent import AgriwatchClient, ENAMClient
 
 MAX_TURNS = 50
-from openkb.schema import get_agents_md
-
-class AgriwatchClient:
-    def __init__(self):
-        self.token_key = None
-        self.get_token()
-
-    def get_token(self):
-        url = f"{BASE_URL}/token.php"
-        payload = {"token_userid": TOKEN_USERID}
-
-        response = requests.post(url, headers=HEADERS, json=payload)
-        response.raise_for_status()
-
-        data = response.json()
-        if data.get("status_code") != 200:
-            raise Exception(f"Failed to get token: {data}")
-
-        self.token_key = data["token_key"]
-        print("🔑 New token generated")
-
-    def call_api(self, endpoint, extra_payload=None):
-        url = f"{BASE_URL}/{endpoint}"
-
-        for attempt in range(MAX_RETRIES):
-            payload = {"token_userid": TOKEN_USERID, "token_key": self.token_key}
-
-            if extra_payload:
-                payload.update(extra_payload)
-
-            try:
-                response = requests.post(url, headers=HEADERS, json=payload)
-
-                # If unauthorized or token expired → regenerate token
-                if response.status_code in [401, 403]:
-                    print("⚠️ Token expired/invalid. Regenerating...")
-                    self.get_token()
-                    continue
-
-                response.raise_for_status()
-                data = response.json()
-
-                # Optional: detect token failure via response body
-                if isinstance(data, dict) and data.get("status") == "error":
-                    if "token" in str(data).lower():
-                        print("⚠️ Token issue in response. Regenerating...")
-                        self.get_token()
-                        continue
-
-                return data
-
-            except Exception as e:
-                print(f"Retry {attempt + 1}/{MAX_RETRIES} failed: {e}")
-                time.sleep(RETRY_DELAY)
-
-        raise Exception(f"Failed API call after retries: {endpoint}")
 
 
 _QUERY_INSTRUCTIONS_TEMPLATE = """\
@@ -112,6 +48,13 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
     - infer commodity/market/state from the user query
     - summarize trends clearly
 7. Synthesize a clear, concise, well-cited answer grounded in wiki content.
+
+eNAM workflow:
+1. Use get_states to identify states.
+2. Use get_apmc_markets to identify mandis/APMCs.
+3. Use get_enam_commodities to identify commodities.
+4. Use exact IDs returned by tools.
+5. Never invent IDs.
 
 Answer based only on wiki content. Be concise.
 Before each tool call, output one short sentence explaining the reason.
@@ -400,6 +343,257 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
             return f"Failed to fetch daily prices: {str(e)}"
 
 
+    enam_client = ENAMClient()
+
+    # ---------------------------------------------------
+    # Tool: Get States
+    # ---------------------------------------------------
+
+    @function_tool(name_override="get_states")
+    def get_states(
+        state: str = "",
+        top_k: int = 50,
+    ) -> str:
+        """
+        Fetch available Indian states from eNAM.
+
+        Use this tool when the user asks:
+        - available states
+        - state lookup
+        - search for a state
+
+        Args:
+            state: Optional partial state name filter
+            top_k: Maximum number of results
+        """
+
+        try:
+
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+
+            data = enam_client.call_api(
+                "getStates",
+                method="GET",
+                headers=headers,
+            )
+
+            rows = data.get("listStates", [])
+
+            results = []
+
+            for row in rows:
+
+                state_name = row.get("stateDescEn", "")
+                state_id = row.get("stateId", "")
+
+                if state:
+                    if state.lower() not in state_name.lower():
+                        continue
+
+                results.append(
+                    f"STATE: {state_name}\nSTATE_ID: {state_id}"
+                )
+
+            results = results[:top_k]
+
+            if not results:
+                return f"No states found matching '{state}'"
+
+            return "\n\n".join(results)
+
+        except Exception as e:
+
+            return f"Failed to fetch states: {str(e)}"
+
+
+    # ---------------------------------------------------
+    # Tool: Get APMC Markets
+    # ---------------------------------------------------
+
+    @function_tool(name_override="get_apmc_markets")
+    def get_apmc_markets(
+        state_id: str = "",
+        state_name: str = "",
+        market: str = "",
+        top_k: int = 50,
+    ) -> str:
+        """
+        Fetch APMC markets for a state from eNAM.
+
+        Use this tool when the user asks:
+        - mandi markets
+        - APMC markets
+        - market lookup
+        - mandi list in a state
+
+        Args:
+            state_id: eNAM state ID
+            state_name: State name
+            market: Optional market filter
+            top_k: Maximum results
+        """
+
+        try:
+
+            # ---------------------------------------------------
+            # Resolve state_id if only state_name provided
+            # ---------------------------------------------------
+
+            if not state_id and state_name:
+
+                states_data = enam_client.call_api(
+                    "getStates",
+                    method="GET",
+                    headers={
+                        "Content-Type":
+                        "application/x-www-form-urlencoded"
+                    },
+                )
+
+                for row in states_data.get("listStates", []):
+
+                    if state_name.lower() in row.get(
+                        "stateDescEn", ""
+                    ).lower():
+
+                        state_id = row.get("stateId")
+                        break
+
+            if not state_id:
+                return "Please provide a valid state."
+
+            # ---------------------------------------------------
+            # Fetch APMC
+            # ---------------------------------------------------
+
+            payload = json.dumps({
+                "language": "en",
+                "stateId": state_id
+            })
+
+            data = enam_client.call_api(
+                "getApmc",
+                headers={
+                    "Content-Type":
+                    "application/x-www-form-urlencoded"
+                },
+                payload=payload,
+            )
+
+            rows = data.get("listStateApmc", [])
+
+            results = []
+
+            for row in rows:
+
+                market_name = row.get("apmcDesc", "")
+                apmc_id = row.get("apmcId", "")
+
+                if market:
+                    if market.lower() not in market_name.lower():
+                        continue
+
+                results.append(
+                    f"""
+    MARKET: {market_name}
+    APMC_ID: {apmc_id}
+    STATE_ID: {state_id}
+    """
+                )
+
+            results = results[:top_k]
+
+            if not results:
+                return "No APMC markets found."
+
+            return "\n\n".join(results)
+
+        except Exception as e:
+
+            return f"Failed to fetch APMC markets: {str(e)}"
+
+
+    # ---------------------------------------------------
+    # Tool: Get Commodities
+    # ---------------------------------------------------
+
+    @function_tool(name_override="get_enam_commodities")
+    def get_enam_commodities(
+        state_id: str,
+        apmc_id: str,
+        commodity: str = "",
+        top_k: int = 50,
+    ) -> str:
+        """
+        Fetch commodities available in an APMC market.
+
+        Use this tool when the user asks:
+        - commodities in a mandi
+        - crops traded in a market
+        - commodity lookup
+
+        Args:
+            state_id: eNAM state ID
+            apmc_id: eNAM APMC ID
+            commodity: Optional commodity filter
+            top_k: Maximum results
+        """
+
+        try:
+
+            payload = json.dumps({
+                "language": "en",
+                "stateId": state_id,
+                "apmcId": apmc_id,
+            })
+
+            data = enam_client.call_api(
+                "getCommodity",
+                headers={
+                    "Content-Type":
+                    "application/x-www-form-urlencoded"
+                },
+                payload=payload,
+            )
+
+            rows = data.get("listCommodity", [])
+
+            results = []
+
+            for row in rows:
+
+                commodity_name = (
+                    row.get("commodityDesc")
+                    or row.get("commodityName")
+                    or ""
+                )
+
+                commodity_id = row.get("commodityId", "")
+
+                if commodity:
+                    if commodity.lower() not in commodity_name.lower():
+                        continue
+
+                results.append(
+                    f"""
+    COMMODITY: {commodity_name}
+    COMMODITY_ID: {commodity_id}
+    """
+                )
+
+            results = results[:top_k]
+
+            if not results:
+                return "No commodities found."
+
+            return "\n\n".join(results)
+
+        except Exception as e:
+
+            return f"Failed to fetch commodities: {str(e)}"
+
     from agents.model_settings import ModelSettings
     from openai import AsyncOpenAI
     from agents import OpenAIChatCompletionsModel
@@ -422,7 +616,7 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, get_image, search, get_daily_prices],
+        tools=[read_file, get_page_content, get_image, search, get_daily_prices, get_states, get_apmc_markets, get_enam_commodities],
         model=model,
         model_settings=ModelSettings(parallel_tool_calls=False, max_tokens=128000),
     )
