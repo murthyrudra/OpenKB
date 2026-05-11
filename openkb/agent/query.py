@@ -12,11 +12,80 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
+
 import re
 import os
+import json
+
+import time 
+from datetime import datetime, timedelta
+import requests
+
+BASE_URL = "https://api.agriwatch.in/apgov"
+HEADERS = {"Content-Type": "application/json"}
+TOKEN_USERID = "apgov_agriwatch"
+MAX_RETRIES = 3
+RETRY_DELAY = 2 # seconds
+
 
 MAX_TURNS = 50
 from openkb.schema import get_agents_md
+
+class AgriwatchClient:
+    def __init__(self):
+        self.token_key = None
+        self.get_token()
+
+    def get_token(self):
+        url = f"{BASE_URL}/token.php"
+        payload = {"token_userid": TOKEN_USERID}
+
+        response = requests.post(url, headers=HEADERS, json=payload)
+        response.raise_for_status()
+
+        data = response.json()
+        if data.get("status_code") != 200:
+            raise Exception(f"Failed to get token: {data}")
+
+        self.token_key = data["token_key"]
+        print("🔑 New token generated")
+
+    def call_api(self, endpoint, extra_payload=None):
+        url = f"{BASE_URL}/{endpoint}"
+
+        for attempt in range(MAX_RETRIES):
+            payload = {"token_userid": TOKEN_USERID, "token_key": self.token_key}
+
+            if extra_payload:
+                payload.update(extra_payload)
+
+            try:
+                response = requests.post(url, headers=HEADERS, json=payload)
+
+                # If unauthorized or token expired → regenerate token
+                if response.status_code in [401, 403]:
+                    print("⚠️ Token expired/invalid. Regenerating...")
+                    self.get_token()
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+
+                # Optional: detect token failure via response body
+                if isinstance(data, dict) and data.get("status") == "error":
+                    if "token" in str(data).lower():
+                        print("⚠️ Token issue in response. Regenerating...")
+                        self.get_token()
+                        continue
+
+                return data
+
+            except Exception as e:
+                print(f"Retry {attempt + 1}/{MAX_RETRIES} failed: {e}")
+                time.sleep(RETRY_DELAY)
+
+        raise Exception(f"Failed API call after retries: {endpoint}")
+
 
 _QUERY_INSTRUCTIONS_TEMPLATE = """\
 You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching the wiki.
@@ -38,7 +107,11 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
      ranges to help you target. Never fetch the whole document.
 5. Source content may reference images (e.g. ![image](sources/images/doc/file.png)).
    Use the get_image tool to view them when needed.
-6. Synthesize a clear, concise, well-cited answer grounded in wiki content.
+6. For agricultural price questions:
+    - use get_daily_prices
+    - infer commodity/market/state from the user query
+    - summarize trends clearly
+7. Synthesize a clear, concise, well-cited answer grounded in wiki content.
 
 Answer based only on wiki content. Be concise.
 Before each tool call, output one short sentence explaining the reason.
@@ -111,6 +184,8 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
     )
 
     document_embeddings = np.array(document_embeddings)
+
+    agri_client = AgriwatchClient()
 
     @function_tool(name_override="search")
     def search(query: str, top_k: int = 5) -> str:
@@ -200,6 +275,131 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
             return ToolOutputImage(image_url=result["image_url"])
         return ToolOutputText(text=result["text"])
 
+    @function_tool(name_override="get_daily_prices")
+    def get_daily_prices(
+        commodity: str = "",
+        market: str = "",
+        state: str = "",
+        date: str = "",
+        top_k: int = 20,
+    ) -> str:
+        """
+        Fetch agricultural commodity daily prices from Agriwatch.
+
+        Use this tool when the user asks about:
+        - commodity prices
+        - mandi prices
+        - arrivals
+        - price trends
+        - market-wise prices
+        - Andhra Pradesh agricultural prices
+
+        Args:
+            commodity: Commodity name like 'Black Gram', 'Cotton', 'Maize'
+            market: Market name like 'Vijaywada'
+            state: State name like 'Andhra Pradesh'
+            date: Price date in YYYY-MM-DD format
+            top_k: Maximum rows to return
+        """
+
+        # Default to today if not provided
+        if not date:
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        print(f"\n[PRICE QUERY]")
+        print(f"commodity={commodity}")
+        print(f"market={market}")
+        print(f"state={state}")
+        print(f"date={date}")
+
+        try:
+
+            data = agri_client.call_api(
+                "dailyPrice.php",
+                {"priceDate": date}
+            )
+
+            rows = data.get("DATA_LIST", [])
+
+            # ---------------------------------------------------
+            # Filtering
+            # ---------------------------------------------------
+
+            filtered = []
+
+            for row in rows:
+
+                if commodity:
+                    if commodity.lower() not in row.get(
+                        "COMMODITY_NAME", ""
+                    ).lower():
+                        continue
+
+                if market:
+                    if market.lower() not in row.get(
+                        "MARKET_NAME", ""
+                    ).lower():
+                        continue
+
+                if state:
+                    if state.lower() not in row.get(
+                        "STATE_NAME", ""
+                    ).lower():
+                        continue
+
+                filtered.append(row)
+
+            # ---------------------------------------------------
+            # Limit results
+            # ---------------------------------------------------
+
+            filtered = filtered[:top_k]
+
+            if not filtered:
+                return (
+                    f"No price data found for "
+                    f"commodity='{commodity}', "
+                    f"market='{market}', "
+                    f"state='{state}', "
+                    f"date='{date}'"
+                )
+
+            # ---------------------------------------------------
+            # Format results
+            # ---------------------------------------------------
+
+            formatted = []
+
+            for item in filtered:
+
+                formatted.append(
+                    f"""
+    COMMODITY: {item.get("COMMODITY_NAME")}
+    VARIETY: {item.get("VARIETY_NAME")}
+    STATE: {item.get("STATE_NAME")}
+    MARKET: {item.get("MARKET_NAME")}
+
+    CURRENT PRICE: {item.get("CURRENT_PRICE")} {item.get("PRICE_UNIT")}
+    PREVIOUS PRICE: {item.get("PREVIOUS_PRICE")}
+
+    PRICE CHANGE: {item.get("MODAL_PRICE_CHANGE")}
+
+    CURRENT ARRIVAL: {item.get("CURRENT_ARRIVAL")} {item.get("ARRIVAL_UNIT")}
+    PREVIOUS ARRIVAL: {item.get("PREVIOUS_ARRIVAL")}
+
+    ARRIVAL CHANGE: {item.get("ARRIVALS_CHANGE")}
+
+    SOURCE: {item.get("SOURCE")}
+    """
+                )
+
+            return "\n\n".join(formatted)
+
+        except Exception as e:
+
+            return f"Failed to fetch daily prices: {str(e)}"
+
+
     from agents.model_settings import ModelSettings
     from openai import AsyncOpenAI
     from agents import OpenAIChatCompletionsModel
@@ -222,7 +422,7 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en", kb_dir: 
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, get_image, search],
+        tools=[read_file, get_page_content, get_image, search, get_daily_prices],
         model=model,
         model_settings=ModelSettings(parallel_tool_calls=False, max_tokens=128000),
     )
