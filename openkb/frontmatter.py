@@ -13,9 +13,10 @@ import json
 import re
 
 import yaml
+from typing import Any
 
 
-def kv_line(key: str, value: str) -> str:
+def kv_line(key: str, value: Any) -> str:
     """Render ``key: "value"`` with the value JSON-quoted (always single-line).
 
     JSON strings are a strict subset of YAML: always single-line, always
@@ -92,7 +93,7 @@ def parse(text: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def set_line(fm_block: str, key: str, value: str) -> str:
+def set_line(fm_block: str, key: str, value: Any) -> str:
     """Set or insert a single scalar ``key:`` line in a frontmatter block.
 
     Replaces an existing line for ``key``; otherwise inserts it right after the

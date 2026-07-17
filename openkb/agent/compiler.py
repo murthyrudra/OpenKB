@@ -17,6 +17,7 @@ which LiteLLM passes through cleanly.
 
 from __future__ import annotations
 
+import os
 import asyncio
 import json
 import logging
@@ -39,6 +40,9 @@ from openkb.config import (
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
 from openkb.locks import atomic_write_text
 from openkb.schema import INDEX_SEED, get_agents_md
+
+from openkb.curriculum.compiler import compile_curriculum_graph
+from openkb.curriculum.planner import CurriculumPlanner
 
 logger = logging.getLogger(__name__)
 
@@ -148,37 +152,127 @@ Write the concept page for: {title}
 This concept relates to the document "{doc_name}" summarized above.
 {update_instruction}
 
-Return a JSON object with two keys:
-- "description": A single sentence (under 100 chars) defining this concept
-- "content": The full concept page in Markdown. Include clear explanation, \
-key details from the source document, and [[wikilinks]] to related concepts \
-and [[summaries/{doc_name}]] — subject to the wikilink rules from the \
-whitelist message above.
+A concept page should explain the concept clearly and generally, not just
+summarize the current document.
 
-Return ONLY valid JSON, no fences.
+Return a JSON object with exactly three keys:
+
+{{
+  "description": "...",
+
+  "curriculum": {{
+    "difficulty": "beginner | intermediate | advanced",
+
+    "estimated_hours": <number>,
+
+    "prerequisites": [
+      "<existing concept>",
+      ...
+    ],
+
+    "learning_objectives": [
+      "...",
+      "..."
+    ],
+
+    "misconceptions": [
+      "...",
+      "..."
+    ],
+
+    "next_concepts": [
+      "<existing concept>",
+      ...
+    ]
+  }},
+
+  "content": "..."
+}}
+
+Requirements:
+
+- "description" must be a single sentence under 100 characters.
+
+- "content" must be valid Markdown.
+
+- Include [[wikilinks]] only to valid pages from the whitelist.
+
+- The curriculum section is for educational metadata only.
+
+- "prerequisites" should contain ONLY concepts that a learner must already
+  understand before studying this concept.
+
+- "next_concepts" should contain ONLY concepts that naturally follow after
+  mastering this one.
+
+- Use ONLY concept names from the provided whitelist for prerequisites and
+  next_concepts.
+
+- If no prerequisite exists, return an empty list.
+
+- Learning objectives should be measurable.
+  Good examples:
+      - Explain self-attention
+      - Compute attention weights
+      - Implement attention in code
+
+- Misconceptions should describe common mistakes students make.
+
+Return ONLY valid JSON.
+No markdown fences.
+No explanation.
 """
 
 _CONCEPT_UPDATE_USER = """\
 Update the concept page for: {title}
 
 Current content of this page:
+
 {existing_content}
 
-New information from document "{doc_name}" (summarized above) should be \
-integrated into this page. Rewrite the full page incorporating the new \
-information naturally — do not just append. Preserve the existing structure \
-and intent of the page.
+Integrate the new information from document "{doc_name}" while preserving the
+overall structure of the page.
 
-For [[wikilinks]] in the rewrite, follow the whitelist rules from the \
-message above: keep links whose target is in the whitelist, convert any \
-existing links whose target is NOT in the whitelist to plain text, and do \
-not invent new wikilink targets.
+Return a JSON object with exactly three keys:
 
-Return a JSON object with two keys:
-- "description": A single sentence (under 100 chars) defining this concept (may differ from before)
-- "content": The rewritten full concept page in Markdown
+{{
+  "description": "...",
 
-Return ONLY valid JSON, no fences.
+  "curriculum": {{
+    "difficulty": "beginner | intermediate | advanced",
+
+    "estimated_hours": <number>,
+
+    "prerequisites": [
+      "<existing concept>"
+    ],
+
+    "learning_objectives": [
+      "..."
+    ],
+
+    "misconceptions": [
+      "..."
+    ],
+
+    "next_concepts": [
+      "<existing concept>"
+    ]
+  }},
+
+  "content": "..."
+}}
+
+Requirements:
+
+- Rewrite the entire page.
+- Do not append.
+- Preserve existing knowledge unless contradicted by the new document.
+- Use only valid wikilinks.
+- Use ONLY concept names from the whitelist for prerequisites and
+  next_concepts.
+
+Return ONLY valid JSON.
 """
 
 _ENTITY_PAGE_USER = """\
@@ -951,9 +1045,11 @@ _parse_yaml_list_value = frontmatter.parse_list_value
 
 
 def _write_concept(
-    wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = ""
+    wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "", metadata: dict | None = None,
 ) -> None:
     """Write or update a concept page, managing the sources frontmatter."""
+    curriculum = (metadata or {}).get("curriculum")
+
     concepts_dir = wiki_dir / "concepts"
     concepts_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _sanitize_concept_name(name)
@@ -993,6 +1089,9 @@ def _write_concept(
             ]
             if brief:
                 fm_lines.append(_yaml_kv_line("description", brief))
+            
+            _append_curriculum(fm_lines, curriculum)
+            
             existing = frontmatter.block(fm_lines) + clean
             atomic_write_text(path, existing)
             return
@@ -1003,6 +1102,9 @@ def _write_concept(
             fm_block = _set_fm_line(fm_block, "type", "Concept")
             if brief:
                 fm_block = _set_fm_line(fm_block, "description", brief)
+
+            _append_curriculum(fm_block, curriculum)
+
             # Drop legacy brief: lines (migrated to description:).
             fm_block = frontmatter.drop_line(fm_block, "brief")
             existing = fm_block + body
@@ -1017,6 +1119,8 @@ def _write_concept(
         ]
         if brief:
             fm_lines.append(_yaml_kv_line("description", brief))
+
+        _append_curriculum(fm_lines, curriculum)
         fm_block = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
         atomic_write_text(path, fm_block + content)
 
@@ -1831,9 +1935,16 @@ async def _compile_concepts(
                 f"concept: {name}",
                 response_format=_JSON_RESPONSE_FORMAT,
             )
-        brief, content, _ = _page_fields(raw)
+        brief, content, obj = _page_fields(raw)
+        
         _require_nonempty_content(content, name)
-        return name, content, False, brief
+        return (
+            name,
+            content,
+            False,
+            brief,
+            obj,
+        )
 
     async def _gen_update(concept: dict) -> tuple[str, str, bool, str]:
         name = concept["name"]
@@ -1865,9 +1976,15 @@ async def _compile_concepts(
                 f"update: {name}",
                 response_format=_JSON_RESPONSE_FORMAT,
             )
-        brief, content, _ = _page_fields(raw)
+        brief, content, obj = _page_fields(raw)
         _require_nonempty_content(content, name)
-        return name, content, True, brief
+        return (
+            name,
+            content,
+            False,
+            brief,
+            obj,
+        )
 
     async def _gen_entity_create(ent: dict) -> tuple[str, str, str, str]:
         name = ent["name"]
@@ -1982,8 +2099,8 @@ async def _compile_concepts(
                 logger.warning("Concept generation failed: %s", r)
                 failure_types.append(type(r).__name__)
                 continue
-            name, page_content, is_update, brief = r
-            pending_writes.append((name, page_content, is_update, brief))
+            name, page_content, is_update, brief, metadata = r
+            pending_writes.append((name, page_content, is_update, brief, metadata))
             safe_name = _sanitize_concept_name(name)
             concept_names.append(safe_name)
             if brief:
@@ -2042,7 +2159,7 @@ async def _compile_concepts(
     # Strip unresolved wikilinks from concept bodies before writing. The
     # whitelist includes existing files + this round's planned slugs +
     # the summary for this document.
-    for i, (name, page_content, is_update, brief) in enumerate(pending_writes):
+    for i, (name, page_content, is_update, brief, metadata) in enumerate(pending_writes):
         cleaned, ghosts = strip_ghost_wikilinks(page_content, known_targets)
         if ghosts:
             logger.info(
@@ -2051,7 +2168,7 @@ async def _compile_concepts(
                 name,
                 ghosts[:5],
             )
-        pending_writes[i] = (name, cleaned, is_update, brief)
+        pending_writes[i] = (name, cleaned, is_update, brief, metadata)
 
     # --- Optional Step 3a: LLM rewrite the summary with full whitelist ---
     # Only for the short-doc path. The long-doc path leaves the indexer-
@@ -2124,7 +2241,7 @@ async def _compile_concepts(
         _write_summary(wiki_dir, doc_name, final_summary, description=doc_brief)
 
     # --- Write concept pages to disk ---
-    for name, page_content, is_update, brief in pending_writes:
+    for name, page_content, is_update, brief, metadata in pending_writes:
         _write_concept(
             wiki_dir,
             name,
@@ -2132,6 +2249,7 @@ async def _compile_concepts(
             source_file,
             is_update,
             brief=brief,
+            metadata=metadata,
         )
 
     # --- Step 3b: Process related items (code only, no LLM) ---
@@ -2171,6 +2289,18 @@ async def _compile_concepts(
         entity_names=entity_names,
         entity_meta=entity_meta,
     )
+
+    graph = compile_curriculum_graph(kb_dir)
+
+    def save_graph(graph, path):
+        with open(path, "w") as f:
+            json.dump(graph.to_dict(), f, indent=2)
+
+    if not os.path.exists(wiki_dir / Path("curriculum")):
+        os.makedirs(wiki_dir / Path("curriculum"), exist_ok=True)
+
+    save_graph(graph, wiki_dir / Path("curriculum") / Path(f"{doc_name}_graph.json"))
+
 
 
 async def compile_short_doc(
@@ -2335,3 +2465,18 @@ async def compile_long_doc(
         # Close per-loop litellm async clients before asyncio.run tears this
         # loop down, to avoid the CLOSE-WAIT/FD leak across a long ingest.
         await _close_async_llm_clients()
+
+
+def _append_curriculum(fm_lines: list[str], curriculum: dict) -> None:
+    if not curriculum:
+        return
+
+    fm_lines.append("curriculum:")
+
+    for key, value in curriculum.items():
+        if isinstance(value, list):
+            fm_lines.append(f"  {key}:")
+            for item in value:
+                fm_lines.append(f"    - {item}")
+        else:
+            fm_lines.append(f"  {key}: {value}")
