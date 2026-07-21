@@ -1120,7 +1120,7 @@ def query(ctx, question, save, raw):
     config = load_config(openkb_dir / "config.yaml")
     _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
-
+    
     stream = _stream_to_tty()
     try:
         answer = asyncio.run(run_query(question, kb_dir, model, stream=stream, raw=raw))
@@ -2002,6 +2002,143 @@ def visualize(ctx, open_browser):
             click.echo(
                 "(couldn't launch a browser — open the file above manually, or use --no-open)"
             )
+
+
+@cli.command()
+@click.argument("concept")
+@click.option(
+    "--completed",
+    default="",
+    help="Comma-separated concept slugs to additionally treat as completed for "
+    "this run only (on top of `openkb learn status`'s saved progress).",
+)
+@click.pass_context
+@_with_kb_lock(exclusive=False)
+def plan(ctx, concept, completed):
+    """Print the ordered learning plan (prerequisites first) for CONCEPT."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.curriculum.compiler import compile_curriculum_graph
+    from openkb.curriculum.parser import normalize_slug
+    from openkb.curriculum.planner import CurriculumPlanner
+    from openkb.curriculum.progress import load_progress
+
+    graph = compile_curriculum_graph(kb_dir / "wiki")
+
+    slug = normalize_slug(concept)
+    if not graph.has(slug):
+        click.echo(f"Unknown concept '{slug}'. Run `openkb list` to see available concepts.")
+        return
+
+    completed_slugs = load_progress(kb_dir).completed | {
+        normalize_slug(c) for c in completed.split(",") if c.strip()
+    }
+
+    planner = CurriculumPlanner(graph)
+    try:
+        path = planner.learning_path(slug)
+    except ValueError as exc:
+        click.echo(f"Could not compute a learning plan: {exc}")
+        return
+
+    remaining = [node for node in path if node.slug not in completed_slugs]
+    if not remaining:
+        click.echo(f"'{slug}' is already fully covered by your completed concepts.")
+        return
+
+    total_hours = sum(node.curriculum.estimated_hours for node in remaining)
+    click.echo(
+        f"Learning plan for '{slug}' ({len(remaining)} concept(s), ~{total_hours:g}h):\n"
+    )
+    for i, node in enumerate(remaining, 1):
+        difficulty = f" [{node.curriculum.difficulty}]" if node.curriculum.difficulty else ""
+        hours = f" (~{node.curriculum.estimated_hours:g}h)" if node.curriculum.estimated_hours else ""
+        click.echo(f"  {i}. {node.title}{difficulty}{hours}")
+
+
+@cli.group()
+def learn():
+    """Track completed concepts and see what's unlocked next."""
+
+
+@learn.command("complete")
+@click.argument("concept")
+@click.pass_context
+@_with_kb_lock(exclusive=True)
+def learn_complete(ctx, concept):
+    """Mark CONCEPT as completed."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.curriculum.compiler import compile_curriculum_graph
+    from openkb.curriculum.parser import normalize_slug
+    from openkb.curriculum.progress import load_progress
+
+    graph = compile_curriculum_graph(kb_dir / "wiki")
+    slug = normalize_slug(concept)
+    if not graph.has(slug):
+        click.echo(f"Unknown concept '{slug}'. Run `openkb list` to see available concepts.")
+        return
+
+    if load_progress(kb_dir).mark_complete(slug):
+        click.echo(f"Marked '{slug}' as completed.")
+    else:
+        click.echo(f"'{slug}' was already marked completed.")
+
+
+@learn.command("incomplete")
+@click.argument("concept")
+@click.pass_context
+@_with_kb_lock(exclusive=True)
+def learn_incomplete(ctx, concept):
+    """Unmark CONCEPT as completed."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.curriculum.parser import normalize_slug
+    from openkb.curriculum.progress import load_progress
+
+    slug = normalize_slug(concept)
+    if load_progress(kb_dir).mark_incomplete(slug):
+        click.echo(f"Unmarked '{slug}' as completed.")
+    else:
+        click.echo(f"'{slug}' was not marked completed.")
+
+
+@learn.command("status")
+@click.pass_context
+@_with_kb_lock(exclusive=False)
+def learn_status(ctx):
+    """Show completed concepts and what's available to learn next."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.curriculum.compiler import compile_curriculum_graph
+    from openkb.curriculum.planner import CurriculumPlanner
+    from openkb.curriculum.progress import load_progress
+
+    graph = compile_curriculum_graph(kb_dir / "wiki")
+    completed = load_progress(kb_dir).completed
+
+    click.echo(f"Completed ({len(completed)}/{len(graph.nodes)}):")
+    for slug in sorted(completed):
+        title = graph.nodes[slug].title if slug in graph.nodes else slug
+        click.echo(f"  - {title}")
+
+    available = CurriculumPlanner(graph).available_concepts(completed)
+    if available:
+        click.echo(f"\nAvailable next ({len(available)}):")
+        for slug in available:
+            click.echo(f"  - {graph.nodes[slug].title}")
 
 
 def print_list(kb_dir: Path) -> None:

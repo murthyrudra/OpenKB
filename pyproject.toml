@@ -31,6 +31,13 @@ keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "age
 # litellm 1.87.2 fixes the chatgpt/* (ChatGPT subscription) provider
 # returning empty Responses output (BerriAI/litellm#25429) and
 # auto-injects GitHub Copilot IDE-auth headers.
+# openai is pinned explicitly (openai-agents==0.17.3 only requires
+# openai<3,>=2.26.0, leaving it otherwise unconstrained): openai>=2.45.0
+# made InputTokensDetails.cache_write_tokens a required field, which
+# openai-agents==0.17.3's bundled LiteLLM adapter doesn't populate,
+# breaking every LiteLLM-routed call (e.g. `openkb query`) with a pydantic
+# validation error. Fixed upstream in openai-agents==0.18.x; until that's
+# vetted and bumped, pin openai below the breaking change.
 dependencies = [
     "pageindex==0.3.0.dev3",
     "markitdown[docx,pptx,xlsx,xls]==0.1.5",
@@ -39,6 +46,7 @@ dependencies = [
     "watchdog==6.0.0",
     "litellm==1.87.2",
     "openai-agents==0.17.3",
+    "openai==2.44.0",
     "pyyaml==6.0.3",
     "python-dotenv==1.2.2",
     "json-repair==0.59.10",

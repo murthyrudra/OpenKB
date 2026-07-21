@@ -111,3 +111,25 @@ def set_line(fm_block: str, key: str, value: Any) -> str:
 def drop_line(fm_block: str, key: str) -> str:
     """Remove any ``key:`` line from a frontmatter block (no-op if absent)."""
     return re.sub(rf"^{re.escape(key)}:.*\n?", "", fm_block, flags=re.MULTILINE)
+
+
+def set_block(fm_block: str, key: str, lines: list[str]) -> str:
+    """Set or replace a nested multi-line ``key:`` block in a frontmatter block.
+
+    ``lines`` is the full replacement block: the header line (``"key:"``)
+    first, with any children indented beneath it. Replaces an existing
+    ``key:`` block (its header line plus every deeper-indented line that
+    follows); otherwise inserts right after the opening ``---``. Passing an
+    empty ``lines`` removes any existing block without inserting one.
+    """
+    fm_block = re.sub(
+        rf"^{re.escape(key)}:.*\n(?:[ \t]+.*\n?)*",
+        "",
+        fm_block,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if not lines:
+        return fm_block
+    block_text = "\n".join(lines)
+    return fm_block.replace("---\n", f"---\n{block_text}\n", 1)

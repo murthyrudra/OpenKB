@@ -14,7 +14,7 @@ from .models import (
 
 from pathlib import Path
 
-def _normalize_slug(value: str) -> str:
+def normalize_slug(value: str) -> str:
     value = value.strip()
 
     # Remove wiki links if present
@@ -36,7 +36,7 @@ def _parse_edges(values):
 
         if isinstance(value, str):
 
-            edges.append(CurriculumEdge(concept=_normalize_slug(value)))
+            edges.append(CurriculumEdge(concept=normalize_slug(value)))
 
     return edges
 

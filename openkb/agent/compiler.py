@@ -1089,9 +1089,9 @@ def _write_concept(
             ]
             if brief:
                 fm_lines.append(_yaml_kv_line("description", brief))
-            
-            _append_curriculum(fm_lines, curriculum)
-            
+
+            fm_lines.extend(_curriculum_lines(curriculum))
+
             existing = frontmatter.block(fm_lines) + clean
             atomic_write_text(path, existing)
             return
@@ -1103,7 +1103,8 @@ def _write_concept(
             if brief:
                 fm_block = _set_fm_line(fm_block, "description", brief)
 
-            _append_curriculum(fm_block, curriculum)
+            if curriculum:
+                fm_block = frontmatter.set_block(fm_block, "curriculum", _curriculum_lines(curriculum))
 
             # Drop legacy brief: lines (migrated to description:).
             fm_block = frontmatter.drop_line(fm_block, "brief")
@@ -1120,7 +1121,7 @@ def _write_concept(
         if brief:
             fm_lines.append(_yaml_kv_line("description", brief))
 
-        _append_curriculum(fm_lines, curriculum)
+        fm_lines.extend(_curriculum_lines(curriculum))
         fm_block = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
         atomic_write_text(path, fm_block + content)
 
@@ -2290,7 +2291,7 @@ async def _compile_concepts(
         entity_meta=entity_meta,
     )
 
-    graph = compile_curriculum_graph(kb_dir)
+    graph = compile_curriculum_graph(wiki_dir)
 
     def save_graph(graph, path):
         with open(path, "w") as f:
@@ -2467,16 +2468,21 @@ async def compile_long_doc(
         await _close_async_llm_clients()
 
 
-def _append_curriculum(fm_lines: list[str], curriculum: dict) -> None:
-    if not curriculum:
-        return
+def _curriculum_lines(curriculum: dict | None) -> list[str]:
+    """Render a curriculum dict as safely-escaped, indented frontmatter lines.
 
-    fm_lines.append("curriculum:")
+    Values are JSON-quoted via ``frontmatter.kv_line``/``list_line`` so LLM
+    text containing colons, quotes, or newlines can't corrupt the YAML block.
+    """
+    if not curriculum:
+        return []
+
+    lines = ["curriculum:"]
 
     for key, value in curriculum.items():
         if isinstance(value, list):
-            fm_lines.append(f"  {key}:")
-            for item in value:
-                fm_lines.append(f"    - {item}")
+            lines.append("  " + frontmatter.list_line(key, value))
         else:
-            fm_lines.append(f"  {key}: {value}")
+            lines.append("  " + frontmatter.kv_line(key, value))
+
+    return lines

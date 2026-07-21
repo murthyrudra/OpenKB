@@ -274,7 +274,7 @@ async def run_query(
     wiki_root = str(kb_dir / "wiki")
 
     agent = build_query_agent(wiki_root, model, language=language)
-
+    
     if not stream:
         result = await Runner.run(agent, question, max_turns=MAX_TURNS)
         return result.final_output or ""
