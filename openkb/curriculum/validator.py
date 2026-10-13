@@ -43,4 +43,10 @@ def validate_graph(graph: CurriculumGraph) -> ValidationResult:
 
             seen.add(edge.concept)
 
+    cycle = graph.find_cycle()
+    if cycle:
+        result.errors.append(
+            "Curriculum graph contains a cycle: " + " -> ".join(cycle)
+        )
+
     return result

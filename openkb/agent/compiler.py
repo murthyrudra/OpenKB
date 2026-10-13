@@ -1065,6 +1065,14 @@ def _write_concept(
         # Strip frontmatter from LLM content to avoid duplicate blocks
         clean_parts = frontmatter.split(content)
         clean = clean_parts[1].lstrip("\n") if clean_parts is not None else content
+
+        # Append the human-readable curriculum section.
+        curriculum_section = _render_curriculum_section(curriculum)
+        if curriculum_section:
+            clean = clean.rstrip() + "\n\n" + curriculum_section + "\n"
+
+        # Replace body with LLM rewrite
+        existing = fm_block + "\n" + clean
         # Replace body with LLM rewrite (prompt asks for full rewrite, not delta)
         ex_parts = frontmatter.split(existing)
         if ex_parts is not None:
@@ -1114,6 +1122,12 @@ def _write_concept(
         clean_parts = frontmatter.split(content)
         if clean_parts is not None:
             content = clean_parts[1].lstrip("\n")
+
+        # Append the human-readable curriculum section.
+        curriculum_section = _render_curriculum_section(curriculum)
+        if curriculum_section:
+            content = content.rstrip() + "\n\n" + curriculum_section + "\n"
+            
         fm_lines = [
             _yaml_kv_line("type", "Concept"),
             _yaml_list_line("sources", [source_file]),
@@ -2486,3 +2500,136 @@ def _curriculum_lines(curriculum: dict | None) -> list[str]:
             lines.append("  " + frontmatter.kv_line(key, value))
 
     return lines
+
+def _normalize_curriculum_slug(value) -> str:
+    """Convert a curriculum concept reference into an Obsidian page slug."""
+    if isinstance(value, dict):
+        value = value.get("concept", "")
+
+    if not isinstance(value, str):
+        return ""
+
+    value = value.strip()
+
+    # Accept either:
+    #   nucleus
+    #   concepts/nucleus
+    #   [[concepts/nucleus]]
+    #   [[concepts/nucleus|Nucleus]]
+    value = value.strip("[]")
+
+    if "|" in value:
+        value = value.split("|", 1)[0]
+
+    if value.startswith("concepts/"):
+        value = value[len("concepts/"):]
+
+    return Path(value).stem
+
+
+def _curriculum_link(value) -> str:
+    """Render a curriculum concept reference as an Obsidian wikilink."""
+    slug = _normalize_curriculum_slug(value)
+
+    if not slug:
+        return ""
+
+    title = slug.replace("-", " ").replace("_", " ").title()
+    return f"[[concepts/{slug}|{title}]]"
+
+
+def _render_curriculum_section(curriculum: dict | None) -> str:
+    """Render curriculum metadata as a human-readable Markdown section.
+
+    Curriculum remains in YAML frontmatter for machine consumption, while
+    this section provides an Obsidian-friendly representation in the body.
+    """
+    if not isinstance(curriculum, dict) or not curriculum:
+        return ""
+
+    sections: list[str] = [
+        "## Curriculum",
+        "",
+    ]
+
+    difficulty = curriculum.get("difficulty")
+    estimated_hours = curriculum.get("estimated_hours")
+
+    if difficulty:
+        sections.append(f"**Difficulty:** {str(difficulty).title()}")
+
+    if estimated_hours:
+        sections.append(
+            f"**Estimated time:** {estimated_hours:g} hours"
+            if isinstance(estimated_hours, (int, float))
+            else f"**Estimated time:** {estimated_hours}"
+        )
+
+    if difficulty or estimated_hours:
+        sections.append("")
+
+    prerequisites = curriculum.get("prerequisites", [])
+    if isinstance(prerequisites, list) and prerequisites:
+        sections.extend([
+            "### Prerequisites",
+            "",
+        ])
+
+        for item in prerequisites:
+            link = _curriculum_link(item)
+            if link:
+                sections.append(f"- {link}")
+
+        sections.append("")
+
+    learning_objectives = curriculum.get("learning_objectives", [])
+    if isinstance(learning_objectives, list) and learning_objectives:
+        sections.extend([
+            "### Learning Objectives",
+            "",
+        ])
+
+        for objective in learning_objectives:
+            if isinstance(objective, dict):
+                objective = objective.get("objective", "")
+
+            if isinstance(objective, str) and objective.strip():
+                sections.append(f"- {objective.strip()}")
+
+        sections.append("")
+
+    misconceptions = curriculum.get("misconceptions", [])
+    if isinstance(misconceptions, list) and misconceptions:
+        sections.extend([
+            "### Common Misconceptions",
+            "",
+        ])
+
+        for misconception in misconceptions:
+            if isinstance(misconception, dict):
+                misconception = misconception.get("misconception", "")
+
+            if isinstance(misconception, str) and misconception.strip():
+                sections.append(f"- {misconception.strip()}")
+
+        sections.append("")
+
+    next_concepts = curriculum.get("next_concepts", [])
+    if isinstance(next_concepts, list) and next_concepts:
+        sections.extend([
+            "### Next Concepts",
+            "",
+        ])
+
+        for item in next_concepts:
+            link = _curriculum_link(item)
+            if link:
+                sections.append(f"- {link}")
+
+        sections.append("")
+
+    # Remove trailing blank lines.
+    while sections and sections[-1] == "":
+        sections.pop()
+
+    return "\n".join(sections)

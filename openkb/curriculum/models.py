@@ -5,9 +5,26 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class CurriculumEdge:
+    """Relationship from the current concept to another concept.
+
+    concept:
+        Slug of the related concept.
+
+    required:
+        Whether the learner must know this concept before learning
+        the current concept.
+
+    dependency:
+        Relationship type. Examples:
+        - prerequisite
+        - conceptual
+        - application
+        - related
+    """
+
     concept: str
     required: bool = True
-    dependency: str = "conceptual"
+    dependency: str = "prerequisite"
 
 
 @dataclass(slots=True)

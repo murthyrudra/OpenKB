@@ -55,38 +55,56 @@ class CurriculumGraph:
                     queue.append(child)
 
         if len(order) != len(self.nodes):
+            cycle = self.find_cycle()
+            detail = " -> ".join(cycle) if cycle else "unknown"
             raise ValueError(
-                "Curriculum graph contains a cycle."
+                f"Curriculum graph contains a cycle: {detail}"
             )
 
         return order
+
+    def find_cycle(self) -> list[str] | None:
+        """Return one cycle as a closed slug path (first == last), or None."""
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {node: WHITE for node in self.nodes}
+        parent: dict[str, str] = {}
+        cycle: list[str] | None = None
+
+        def visit(node: str) -> None:
+            nonlocal cycle
+
+            color[node] = GRAY
+
+            for child in self.children.get(node, ()):
+                if cycle:
+                    return
+
+                if color[child] == WHITE:
+                    parent[child] = node
+                    visit(child)
+                elif color[child] == GRAY:
+                    path = [child]
+                    cur = node
+                    while cur != child:
+                        path.append(cur)
+                        cur = parent[cur]
+                    path.append(child)
+                    cycle = list(reversed(path))
+
+            color[node] = BLACK
+
+        for node in self.nodes:
+            if color[node] == WHITE and not cycle:
+                visit(node)
+
+        return cycle
     
     def parents_of(self, slug: str) -> set[str]:
         return self.parents.get(slug, set())
     
     def children_of(self, slug: str) -> set[str]:
         return self.children.get(slug, set())
-    
-    def ancestors(self, slug: str) -> set[str]:
-        """
-        Return every prerequisite (direct and indirect)
-        of the given concept.
-        """
-
-        visited = set()
-        stack = list(self.parents_of(slug))
-
-        while stack:
-            node = stack.pop()
-
-            if node in visited:
-                continue
-
-            visited.add(node)
-
-            stack.extend(self.parents_of(node) - visited)
-
-        return visited
     
     def _reachable(
         self,

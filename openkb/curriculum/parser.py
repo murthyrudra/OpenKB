@@ -26,7 +26,6 @@ def normalize_slug(value: str) -> str:
     return value
 
 def _parse_edges(values):
-
     if not isinstance(values, list):
         return []
 
@@ -34,9 +33,43 @@ def _parse_edges(values):
 
     for value in values:
 
+        # Simple form:
+        #
+        # prerequisites:
+        #   - nucleus
+        #
         if isinstance(value, str):
+            edges.append(
+                CurriculumEdge(
+                    concept=normalize_slug(value),
+                    required=True,
+                    dependency="prerequisite",
+                )
+            )
+            continue
 
-            edges.append(CurriculumEdge(concept=normalize_slug(value)))
+        # Structured form:
+        #
+        # prerequisites:
+        #   - concept: nucleus
+        #     required: true
+        #     dependency: prerequisite
+        #
+        if isinstance(value, dict):
+            concept = value.get("concept")
+
+            if not isinstance(concept, str) or not concept.strip():
+                continue
+
+            edges.append(
+                CurriculumEdge(
+                    concept=normalize_slug(str(concept)),
+                    required=bool(value.get("required", True)),
+                    dependency=str(
+                        value.get("dependency", "prerequisite")
+                    ),
+                )
+            )
 
     return edges
 

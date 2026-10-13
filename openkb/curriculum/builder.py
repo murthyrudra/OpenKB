@@ -28,8 +28,16 @@ def build_curriculum_graph(
                 )
                 continue
 
-            graph.children[prerequisite].add(slug)
 
+            # Only required relationships participate in the
+            # educational prerequisite DAG.
+            if not edge.required:
+                continue
+
+            if edge.dependency != "prerequisite":
+                continue
+            
+            graph.children[prerequisite].add(slug)
             graph.parents[slug].add(prerequisite)
 
     return graph
