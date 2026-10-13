@@ -20,6 +20,7 @@
 <details open>
 <summary><h2>📢 Recent Updates</h2></summary>
 
+- *Curriculum & Learning Paths*: Concept pages are enriched with difficulty, estimated study time, prerequisites, and learning objectives. `openkb plan` and `openkb learn` turn that into an ordered course you can track progress against.
 - *Google Open Knowledge Format (OKF)*: Wiki pages follow the [Google OKF](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) specification for knowledge sharing.
 - *Entity Pages*: People, orgs, places, and products as dedicated wiki pages, auto-extracted and kept in sync.
 
@@ -45,6 +46,7 @@ OpenKB has two layers: a **wiki foundation** that compiles and maintains your kn
 - **Scales to long documents:** Long and complex documents are handled via [PageIndex](https://github.com/VectifyAI/PageIndex) tree indexing, enabling accurate, vectorless, context-aware retrieval.
 - **Native multi-modality:** Retrieves and understands figures, tables, and images, not just text.
 - **Compiled wiki:** The LLM compiles your documents into summaries, concept pages, entity pages, and cross-links, all kept in sync.
+- **Curriculum-aware:** Concept pages carry difficulty, estimated hours, prerequisites, and learning objectives, auto-compiled into a dependency graph you can query for ordered learning paths.
 - **Query & chat:** One-off questions or multi-turn conversations over your wiki, with persisted sessions to resume.
 - **Skill Factory:** Distills redistributable agent skills from your wiki.
 - **OKF-ready:** Wiki pages follow the [Google OKF](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) specification for knowledge sharing.
@@ -140,7 +142,7 @@ When you add a document, the LLM:
 
 1. Generates a **summary** page
 2. Reads existing **concept** and **entity** pages
-3. Creates or updates concepts with cross-document synthesis
+3. Creates or updates concepts with cross-document synthesis, including **curriculum metadata** (difficulty, estimated hours, prerequisites, learning objectives, misconceptions)
 4. Creates or updates **entity** pages (people, orgs, places, products)
 5. Updates the **index** and **log**
 
@@ -204,6 +206,18 @@ A "generator" reads from the compiled wiki and produces something usable: an ans
 ### 🛠 Skill Factory — *drop in a book; out comes a digital expert.*
 
 The flagship generator: `openkb skill new` distills a portable [agent skill](https://docs.claude.com/en/docs/build-with-claude/skills) from your wiki that Claude Code, Codex, and Gemini can install and load natively. Drop in a book's worth of papers; out comes a specialist other agents can call on. → A real generated skill, plus install / share / `eval` / rollback, is walked through in **[`examples/skills/`](examples/skills/)**.
+
+### 🎓 Curriculum — *turn your wiki into an ordered course.*
+
+Every concept page is compiled with curriculum metadata alongside its description: difficulty, estimated study hours, prerequisites, learning objectives, misconceptions, and natural next concepts. OpenKB links these across your whole wiki into a prerequisite graph, automatically, as you add documents — no separate "build a curriculum" step.
+
+| Command | Description |
+|---|---|
+| <code>openkb&nbsp;plan&nbsp;&lt;concept&gt;</code> | Print the ordered learning plan (prerequisites first) for `<concept>`, with difficulty and time estimates (`--completed` to also treat extra concepts as already known) |
+| `openkb learn status` | Show which concepts you've completed and what's available to learn next |
+| <code>openkb&nbsp;learn&nbsp;complete&nbsp;&lt;concept&gt;</code> / <code>openkb&nbsp;learn&nbsp;incomplete&nbsp;&lt;concept&gt;</code> | Mark or unmark a concept as completed |
+
+Progress is tracked per knowledge base in `.openkb/progress.json`. The underlying prerequisite graph is validated for missing, duplicate, and cyclic dependencies whenever it's compiled.
 
 # 🔧 Configuration
 
